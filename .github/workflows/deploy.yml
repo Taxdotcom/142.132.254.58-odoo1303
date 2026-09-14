@@ -1,0 +1,156 @@
+name: Odoo Deployment - odoo1303-production
+
+on:
+  push:
+    branches:
+      - 'production'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: odoo-deploy-odoo1303-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: odoo1303-production
+
+    steps:
+      - name: Verify workflow ref
+        shell: bash
+        env:
+          BRANCH: 'production'
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$REF_NAME" == "$BRANCH" ]] || {
+            echo "ERROR: Workflow ref '$REF_NAME' does not match registered branch '$BRANCH'." >&2
+            exit 1
+          }
+
+      - name: Create GitHub deployment
+        id: deployment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: 'odoo1303-production'
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "ERROR: Invalid workflow commit SHA." >&2
+            exit 1
+          }
+
+          payload=$(python3 -c 'import json,os; print(json.dumps({"ref":os.environ["COMMIT"],"environment":os.environ["TARGET"],"auto_merge":False,"required_contexts":[]}))')
+          response=$(curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/deployments" \
+            -d "$payload")
+
+          deployment_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$response")
+          [[ "$deployment_id" =~ ^[0-9]+$ ]] || {
+            echo "ERROR: Invalid deployment ID." >&2
+            exit 1
+          }
+          echo "deployment_id=$deployment_id" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.ODOO_DEPLOY_HOST }}
+          DEPLOY_KEY: ${{ secrets.ODOO_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.ODOO_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$DEPLOY_HOST" ]] || { echo "ERROR: ODOO_DEPLOY_HOST is missing." >&2; exit 1; }
+          [[ -n "$DEPLOY_KEY" ]] || { echo "ERROR: ODOO_DEPLOY_SSH_KEY is missing." >&2; exit 1; }
+          [[ -n "$DEPLOY_KNOWN_HOSTS" ]] || { echo "ERROR: ODOO_DEPLOY_KNOWN_HOSTS is missing." >&2; exit 1; }
+
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/odoo_deploy_key"
+          chmod 0600 "$HOME/.ssh/odoo_deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0644 "$HOME/.ssh/known_hosts"
+
+          ssh-keygen -F "$DEPLOY_HOST" -f "$HOME/.ssh/known_hosts" >/dev/null || {
+            echo "ERROR: No matching known_hosts entry exists for $DEPLOY_HOST." >&2
+            echo "Known host names supplied:" >&2
+            awk '{print $1}' "$HOME/.ssh/known_hosts" >&2
+            exit 1
+          }
+
+          ssh-keygen -y -f "$HOME/.ssh/odoo_deploy_key" >/dev/null || {
+            echo "ERROR: ODOO_DEPLOY_SSH_KEY is not a readable private SSH key." >&2
+            exit 1
+          }
+
+      - name: Deploy exact workflow commit
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.ODOO_DEPLOY_HOST }}
+          TARGET: 'odoo1303-production'
+          BRANCH: 'production'
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "ERROR: Invalid workflow commit SHA." >&2
+            exit 1
+          }
+
+          echo "Deploying:"
+          echo "  Target: $TARGET"
+          echo "  Branch: $BRANCH"
+          echo "  Commit: $COMMIT"
+
+          ssh \
+            -i "$HOME/.ssh/odoo_deploy_key" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            "odoo-deploy@${DEPLOY_HOST}" \
+            "deploy ${TARGET} ${BRANCH} ${COMMIT}"
+
+      - name: Mark deployment successful
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.deployment_id }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            -d '{"state":"success","description":"Odoo deployment succeeded"}' >/dev/null
+
+      - name: Mark deployment failed
+        if: failure() && steps.deployment.outputs.deployment_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.deployment_id }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            -d '{"state":"failure","description":"Odoo deployment failed"}' >/dev/null
